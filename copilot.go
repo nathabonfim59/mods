@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -46,20 +47,21 @@ func NewCopilotHTTPClient() *CopilotHTTPClient {
 }
 
 func (c *CopilotHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Editor-Version", CopilotEditorVersion)
 	req.Header.Set("User-Agent", CopilotUserAgent)
 
 	var isTokenExpired bool = c.AccessToken != nil && c.AccessToken.ExpiresAt < time.Now().Unix()
 
 	if c.AccessToken == nil || isTokenExpired {
-		// Use the base http.Client for token requests to avoid recursion
 		accessToken, err := getCopilotAccessToken(c.client)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get access token: %w", err)
 		}
-
 		c.AccessToken = &accessToken
+	}
+
+	if c.AccessToken != nil {
+		req.Header.Set("Authorization", "Bearer "+c.AccessToken.Token)
 	}
 
 	return c.client.Do(req)
@@ -115,6 +117,17 @@ func extractCopilotTokenFromFile(path string) (string, error) {
 }
 
 func getCopilotAccessToken(client *http.Client) (CopilotAccessToken, error) {
+	cache, err := NewExpiringCache[CopilotAccessToken]()
+	if err == nil {
+		var token CopilotAccessToken
+		err = cache.Read("copilot", func(r io.Reader) error {
+			return json.NewDecoder(r).Decode(&token)
+		})
+		if err == nil && token.ExpiresAt > time.Now().Unix() {
+			return token, nil
+		}
+	}
+
 	refreshToken, err := getCopilotRefreshToken()
 	if err != nil {
 		return CopilotAccessToken{}, fmt.Errorf("failed to get refresh token: %w", err)
@@ -143,6 +156,14 @@ func getCopilotAccessToken(client *http.Client) (CopilotAccessToken, error) {
 
 	if tokenResponse.ErrorDetails != nil {
 		return CopilotAccessToken{}, fmt.Errorf("token error: %s", tokenResponse.ErrorDetails.Message)
+	}
+
+	if cache != nil {
+		if err := cache.Write("copilot", tokenResponse.ExpiresAt, func(w io.Writer) error {
+			return json.NewEncoder(w).Encode(tokenResponse)
+		}); err != nil {
+			return CopilotAccessToken{}, fmt.Errorf("failed to cache token: %w", err)
+		}
 	}
 
 	return tokenResponse, nil
